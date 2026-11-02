@@ -11,7 +11,6 @@ c_dispatch/bench_e2e
 c_dispatch/benchmark_suite
 c_dispatch/bench_prims
 c_dispatch/test_key_pool
-c_dispatch/tests/test_*
 
 # Logs and runtime JSON artifacts
 *.log
