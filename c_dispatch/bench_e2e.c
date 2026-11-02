@@ -58,6 +58,8 @@ static const char *g_host        = "127.0.0.1";
 static int         g_runs        = 1000;
 static const char *g_kdf         = "sha256";
 static int         g_precompute  = 0;
+static int         g_filter_mode = -1; /* -1: all modes, 0: SEQ only, 1: PAR only, 2: ADA only */
+static const char *g_out_file    = NULL;
 
 /* ═══════════════════════════════════════════════════════════════════
  * Benchmark modes
@@ -200,6 +202,14 @@ static void parse_args(int argc, char *argv[])
             g_kdf = argv[++i];
         else if (strcmp(argv[i], "--precompute") == 0)
             g_precompute = 1;
+        else if (strcmp(argv[i], "--seq") == 0)
+            g_filter_mode = MODE_STRICT_SEQUENTIAL;
+        else if (strcmp(argv[i], "--par") == 0)
+            g_filter_mode = MODE_STRICT_PARALLEL;
+        else if (strcmp(argv[i], "--ada") == 0)
+            g_filter_mode = MODE_ADAPTIVE_SWITCH;
+        else if (strcmp(argv[i], "--out") == 0 && i + 1 < argc)
+            g_out_file = argv[++i];
     }
 }
 
@@ -221,6 +231,14 @@ int main(int argc, char *argv[])
     printf("  Iterations: %d\n", g_runs);
     printf("  KDF:        %s\n", g_kdf);
     printf("  Key Pool:   %s\n", g_precompute ? "ENABLED (pre-computed ephemeral key pool)" : "DISABLED (on-demand generation)");
+    if (g_filter_mode == MODE_STRICT_SEQUENTIAL)
+        printf("  Filter:     Sequential Only (--seq)\n");
+    else if (g_filter_mode == MODE_STRICT_PARALLEL)
+        printf("  Filter:     Parallel Only (--par)\n");
+    else if (g_filter_mode == MODE_ADAPTIVE_SWITCH)
+        printf("  Filter:     Adaptive Switch Only (--ada)\n");
+    else
+        printf("  Filter:     All Modes (Sequential, Parallel, Adaptive)\n");
     printf("═══════════════════════════════════════════════════════════════\n\n");
 
     /* Initialize pre-computed key pool if requested */
@@ -253,12 +271,19 @@ int main(int argc, char *argv[])
     double *samples = malloc(sizeof(double) * (size_t)g_runs);
     if (!samples) { fprintf(stderr, "OOM\n"); return 1; }
 
-    BenchMode modes[] = {
+    BenchMode all_modes[] = {
         MODE_STRICT_SEQUENTIAL,
         MODE_STRICT_PARALLEL,
         MODE_ADAPTIVE_SWITCH
     };
-    int n_modes = 3;
+
+    BenchMode modes[3];
+    int n_modes = 0;
+    if (g_filter_mode >= 0) {
+        modes[n_modes++] = (BenchMode)g_filter_mode;
+    } else {
+        for (int i = 0; i < 3; i++) modes[n_modes++] = all_modes[i];
+    }
 
     int max_results = n_hybrids * n_modes;
     BenchResult *all_results = calloc((size_t)max_results, sizeof(BenchResult));
@@ -314,7 +339,27 @@ int main(int argc, char *argv[])
         printf("\n");
     }
 
-    export_results("e2e_benchmark_results.json", all_results, result_idx);
+    /* Output filename selection */
+    char default_out[128];
+    if (g_out_file) {
+        snprintf(default_out, sizeof(default_out), "%s", g_out_file);
+    } else {
+        if (g_filter_mode == MODE_STRICT_SEQUENTIAL) {
+            snprintf(default_out, sizeof(default_out), "e2e_sequential%s.json",
+                     g_precompute ? "_precomputed" : "");
+        } else if (g_filter_mode == MODE_STRICT_PARALLEL) {
+            snprintf(default_out, sizeof(default_out), "e2e_parallel%s.json",
+                     g_precompute ? "_precomputed" : "");
+        } else if (g_filter_mode == MODE_ADAPTIVE_SWITCH) {
+            snprintf(default_out, sizeof(default_out), "e2e_adaptive%s.json",
+                     g_precompute ? "_precomputed" : "");
+        } else {
+            snprintf(default_out, sizeof(default_out), "e2e_benchmark_results%s.json",
+                     g_precompute ? "_precomputed" : "");
+        }
+    }
+
+    export_results(default_out, all_results, result_idx);
 
     if (g_precompute) {
         key_pool_destroy();
