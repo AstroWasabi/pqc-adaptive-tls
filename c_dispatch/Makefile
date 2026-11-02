@@ -1,14 +1,11 @@
 # c_dispatch/Makefile
 # ═══════════════════════════════════════════════════════════════════
-# Build system for pqc-adaptive-tls
+# Build system for pqc-adaptive-tls (Linux / POSIX)
 # Adaptive Client-Side Parallel Hybrid Post-Quantum TLS 1.3
 # ═══════════════════════════════════════════════════════════════════
 
-# ─── liboqs detection ───────────────────────────────────────────
+# ─── liboqs detection (Standard Linux /usr, /usr/local, or custom) ───
 LIBOQS_DIR ?= $(wildcard /home/sudoroot/_oqs)
-ifeq ($(LIBOQS_DIR),)
-  LIBOQS_DIR := $(wildcard /opt/homebrew/opt/liboqs)
-endif
 ifeq ($(LIBOQS_DIR),)
   LIBOQS_DIR := $(wildcard /usr/local)
 endif
@@ -21,20 +18,19 @@ ifeq ($(LIBOQS_LIB_DIR),)
   LIBOQS_LIB_DIR := $(LIBOQS_DIR)/lib
 endif
 
-# ─── OpenSSL 3.x detection ───────────────────────────────────────
-OPENSSL_DIR ?= $(wildcard /opt/homebrew/opt/openssl@3)
-ifeq ($(OPENSSL_DIR),)
-  OPENSSL_DIR := /usr
+# ─── OpenSSL 3.x detection (Linux standard) ───────────────────────
+OPENSSL_DIR ?= /usr
+OPENSSL_INC := $(OPENSSL_DIR)/include
+OPENSSL_LIB := $(wildcard $(OPENSSL_DIR)/lib64)
+ifeq ($(OPENSSL_LIB),)
+  OPENSSL_LIB := $(OPENSSL_DIR)/lib
 endif
 
-OPENSSL_INC := $(OPENSSL_DIR)/include
-OPENSSL_LIB := $(OPENSSL_DIR)/lib
-
-# ─── Vendored library directories ──────────────────────────────
+# ─── Vendored library directories ─────────────────────────────────
 BLAKE3_DIR := ./vendor/blake3
 CJSON_DIR  := ./vendor/cjson
 
-# ─── Compiler / Flags ───────────────────────────────────────────
+# ─── Compiler / Flags ─────────────────────────────────────────────
 CC      := gcc
 CFLAGS  := -Wall -Wextra -O3 -std=c11 -pthread \
            -D_GNU_SOURCE \
@@ -51,7 +47,7 @@ LDFLAGS := -L$(LIBOQS_LIB_DIR) \
 
 .DEFAULT_GOAL := all
 
-# ─── BLAKE3 objects ─────────────────────────────────────────────
+# ─── BLAKE3 objects (x86-64 Linux SIMD) ───────────────────────────
 BLAKE3_CORE_SRCS := $(BLAKE3_DIR)/blake3.c \
                     $(BLAKE3_DIR)/blake3_dispatch.c \
                     $(BLAKE3_DIR)/blake3_portable.c
@@ -70,25 +66,18 @@ $(BLAKE3_DIR)/blake3_avx2.o: $(BLAKE3_DIR)/blake3_avx2.c
 $(BLAKE3_DIR)/blake3_avx512.o: $(BLAKE3_DIR)/blake3_avx512.c
 	$(CC) $(CFLAGS) -mavx512f -mavx512vl -c $< -o $@
 
-# Detect architecture for BLAKE3 SIMD
-UNAME_M := $(shell uname -m)
-ifeq ($(UNAME_M),x86_64)
-  BLAKE3_SIMD_OBJS := $(BLAKE3_DIR)/blake3_sse2.o \
-                      $(BLAKE3_DIR)/blake3_sse41.o \
-                      $(BLAKE3_DIR)/blake3_avx2.o \
-                      $(BLAKE3_DIR)/blake3_avx512.o
-else
-  BLAKE3_SIMD_OBJS :=
-  CFLAGS += -DBLAKE3_USE_NEON=0
-endif
+BLAKE3_SIMD_OBJS := $(BLAKE3_DIR)/blake3_sse2.o \
+                    $(BLAKE3_DIR)/blake3_sse41.o \
+                    $(BLAKE3_DIR)/blake3_avx2.o \
+                    $(BLAKE3_DIR)/blake3_avx512.o
 
 BLAKE3_OBJS := $(BLAKE3_CORE_OBJS) $(BLAKE3_SIMD_OBJS)
 
-# ─── cJSON ──────────────────────────────────────────────────────
+# ─── cJSON ────────────────────────────────────────────────────────
 CJSON_SRCS := $(CJSON_DIR)/cJSON.c
 CJSON_OBJS := $(CJSON_SRCS:.c=.o)
 
-# ─── Dispatch runtime core ─────────────────────────────────────
+# ─── Dispatch runtime core ───────────────────────────────────────
 DISPATCH_SRCS := src/telemetry.c \
                  src/engine.c \
                  src/dispatcher.c \
@@ -98,20 +87,20 @@ DISPATCH_SRCS := src/telemetry.c \
 
 DISPATCH_OBJS := $(DISPATCH_SRCS:.c=.o)
 
-# ─── All common objects ────────────────────────────────────────
+# ─── All common objects ──────────────────────────────────────────
 ALL_COMMON := $(DISPATCH_OBJS) $(BLAKE3_OBJS) $(CJSON_OBJS)
 
-# ─── Generic compile rule ──────────────────────────────────────
+# ─── Generic compile rule ────────────────────────────────────────
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
-# ─── Targets ───────────────────────────────────────────────────
+# ─── Targets ─────────────────────────────────────────────────────
 .PHONY: all clean test test-asan test-tsan
 
 all: server bench_e2e benchmark_suite bench_prims
 	@echo ""
 	@echo "═══════════════════════════════════════════════════════"
-	@echo "  Build complete:"
+	@echo "  Build complete (Linux):"
 	@echo "    ./server           — Adaptive Dispatch TLS Server"
 	@echo "    ./bench_e2e        — End-to-End Network Benchmark"
 	@echo "    ./benchmark_suite  — Local Handshake Benchmark"

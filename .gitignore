@@ -4,13 +4,13 @@
 *.o
 *.a
 *.so
-*.dylib
 
-# Binaries
+# Executables
 c_dispatch/server
 c_dispatch/bench_e2e
 c_dispatch/benchmark_suite
 c_dispatch/bench_prims
+c_dispatch/test_key_pool
 c_dispatch/tests/test_*
 
 # Logs and runtime JSON artifacts
@@ -21,7 +21,6 @@ c_dispatch/benchmark_results.json
 c_dispatch/e2e_benchmark_results.json
 
 # Tooling & IDE
-.DS_Store
 .vscode/
 .idea/
 compile_commands.json
