@@ -529,6 +529,9 @@ double execute_dispatch_handshake(const char *host,
     uint8_t *pqc_ct = NULL;
     size_t pqc_ct_len = 0;
 
+    int client_affinity_saved = 0;
+    cpu_set_t orig_client_cpuset;
+
     if (combo->profile == PROFILE_HYBRID) {
         PQCEncapsArgs pqc_args = {
             .pqc_name     = combo->pqc_name,
@@ -548,6 +551,9 @@ double execute_dispatch_handshake(const char *host,
             if (g_client_worker_initialized) {
                 int n_cpus = (int)sysconf(_SC_NPROCESSORS_ONLN);
                 if (n_cpus >= 2) {
+                    if (pthread_getaffinity_np(pthread_self(), sizeof(orig_client_cpuset), &orig_client_cpuset) == 0) {
+                        client_affinity_saved = 1;
+                    }
                     cpu_set_t cpuset;
                     CPU_ZERO(&cpuset);
                     CPU_SET(0, &cpuset);
@@ -586,6 +592,11 @@ double execute_dispatch_handshake(const char *host,
                 pthread_cond_wait(&g_client_worker.done_cond, &g_client_worker.mutex);
             }
             pthread_mutex_unlock(&g_client_worker.mutex);
+
+            /* Restore original unpinned CPU affinity on main calling thread */
+            if (client_affinity_saved) {
+                pthread_setaffinity_np(pthread_self(), sizeof(orig_client_cpuset), &orig_client_cpuset);
+            }
         }
 
         free(pqc_pk); pqc_pk = NULL;
