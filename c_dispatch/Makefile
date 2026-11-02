@@ -97,7 +97,7 @@ ALL_COMMON := $(DISPATCH_OBJS) $(BLAKE3_OBJS) $(CJSON_OBJS)
 # ─── Targets ─────────────────────────────────────────────────────
 .PHONY: all clean test test-asan test-tsan
 
-all: server bench_e2e benchmark_suite bench_prims
+all: server bench_e2e benchmark_suite bench_prims test_key_pool
 	@echo ""
 	@echo "═══════════════════════════════════════════════════════"
 	@echo "  Build complete (Linux):"
@@ -105,6 +105,7 @@ all: server bench_e2e benchmark_suite bench_prims
 	@echo "    ./bench_e2e        — End-to-End Network Benchmark"
 	@echo "    ./benchmark_suite  — Local Handshake Benchmark"
 	@echo "    ./bench_prims      — Cryptographic Primitives Benchmark"
+	@echo "    ./test_key_pool    — Key Pool Unit Test"
 	@echo "═══════════════════════════════════════════════════════"
 
 server: server.o $(ALL_COMMON)
@@ -118,6 +119,9 @@ benchmark_suite: benchmark_suite.o $(ALL_COMMON)
 
 bench_prims: bench_prims.o
 	$(CC) -o $@ $^ $(LDFLAGS)
+
+tests/test_key_pool.o: tests/test_key_pool.c
+	$(CC) $(CFLAGS) -c $< -o $@
 
 test_key_pool: tests/test_key_pool.o $(ALL_COMMON)
 	$(CC) -o $@ $^ $(LDFLAGS)
