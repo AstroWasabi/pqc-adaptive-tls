@@ -2,12 +2,16 @@
  * ═══════════════════════════════════════════════════════════════════
  * Dedicated Sequential Hybrid PQC TLS 1.3 Server (Wire Framing V2)
  *
- * Designed specifically for high-throughput, sequential processing.
+ * Supports both:
+ *   1. Standard Inline Ephemeral Keygen (Default)
+ *   2. Server-Side Pre-Computed Key Share Pool (--precompute)
+ *      Pre-generates server classical key shares before listening,
+ *      allowing O(1) (< 1 µs) retrieval on client connection.
  *
  * Wire Flow:
  *   1. Recv: ClientHello (WireHeaderV2 + ClientHelloMetaV2 + c_pub + pqc_pk)
  *   2. Compute:
- *      - EC keygen & derive shared secret
+ *      - EC keygen & derive shared secret (or pop from precomputed pool)
  *      - KEM encaps against client's pqc_pk -> produces (ct, ss)
  *      - Derive session key via RFC 9954 combiner
  *   3. Send: ServerHello (WireHeaderV2 + ServerHelloMetaV2 + srv_pub + ct)
@@ -20,13 +24,14 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <pthread.h>
+#include <signal.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
-#include <unistd.h>
 #include <time.h>
-#include <stdatomic.h>
+#include <unistd.h>
 
 #include "include/algo_config.h"
 #include "include/crypto_engine.h"
@@ -35,6 +40,260 @@
 
 #define SERVER_HOST "0.0.0.0"
 #define SERVER_PORT 4444
+#define DEFAULT_POOL_CAPACITY 64
+
+/* ─── Server Precomputed Key Share Pool ────────────────────────────── */
+
+typedef struct {
+    EVP_PKEY *srv_priv;
+    uint8_t   srv_pub[300];
+    size_t    srv_pub_len;
+} ServerKeyShare;
+
+typedef struct {
+    ServerKeyShare  *slots;
+    size_t           capacity;
+    size_t           head;
+    size_t           tail;
+    size_t           count;
+    pthread_mutex_t  lock;
+    const AlgoCombo *combo;
+} ServerKeyRing;
+
+typedef struct {
+    ServerKeyRing   rings[8];
+    int             num_rings;
+    pthread_t       worker_thread;
+    pthread_mutex_t worker_mutex;
+    pthread_cond_t  refill_cond;
+    int             running;
+    int             initialized;
+    size_t          capacity;
+    atomic_ulong    total_popped;
+    atomic_ulong    total_replenished;
+} ServerKeyPool;
+
+static ServerKeyPool g_server_pool;
+static int g_server_precompute = 0;
+static size_t g_pool_capacity = DEFAULT_POOL_CAPACITY;
+
+static int generate_server_share(const AlgoCombo *combo, ServerKeyShare *out)
+{
+    memset(out, 0, sizeof(*out));
+    if (combo->classical_curve == CURVE_NONE) return 0;
+
+    out->srv_priv = crypto_generate_keypair(combo->classical_curve);
+    if (!out->srv_priv) return -1;
+
+    if (combo->classical_curve == CURVE_X25519) {
+        if (crypto_export_x25519_pub_raw(out->srv_priv, out->srv_pub, &out->srv_pub_len) != 0) {
+            EVP_PKEY_free(out->srv_priv);
+            out->srv_priv = NULL;
+            return -1;
+        }
+    } else {
+        if (crypto_export_ec_pub_der(out->srv_priv, out->srv_pub, &out->srv_pub_len) != 0) {
+            EVP_PKEY_free(out->srv_priv);
+            out->srv_priv = NULL;
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static void *server_key_pool_worker_loop(void *arg)
+{
+    ServerKeyPool *p = (ServerKeyPool *)arg;
+
+    while (1) {
+        pthread_mutex_lock(&p->worker_mutex);
+        while (p->running) {
+            int need_refill = 0;
+            for (int r = 0; r < p->num_rings; r++) {
+                ServerKeyRing *ring = &p->rings[r];
+                pthread_mutex_lock(&ring->lock);
+                if (ring->count < ring->capacity) {
+                    need_refill = 1;
+                    pthread_mutex_unlock(&ring->lock);
+                    break;
+                }
+                pthread_mutex_unlock(&ring->lock);
+            }
+            if (need_refill) break;
+            pthread_cond_wait(&p->refill_cond, &p->worker_mutex);
+        }
+
+        if (!p->running) {
+            pthread_mutex_unlock(&p->worker_mutex);
+            break;
+        }
+        pthread_mutex_unlock(&p->worker_mutex);
+
+        for (int r = 0; r < p->num_rings && p->running; r++) {
+            ServerKeyRing *ring = &p->rings[r];
+            while (p->running) {
+                pthread_mutex_lock(&ring->lock);
+                if (ring->count >= ring->capacity) {
+                    pthread_mutex_unlock(&ring->lock);
+                    break;
+                }
+                pthread_mutex_unlock(&ring->lock);
+
+                ServerKeyShare share;
+                if (generate_server_share(ring->combo, &share) != 0) {
+                    usleep(1000);
+                    continue;
+                }
+
+                pthread_mutex_lock(&ring->lock);
+                if (ring->count < ring->capacity) {
+                    ring->slots[ring->tail] = share;
+                    ring->tail = (ring->tail + 1) % ring->capacity;
+                    ring->count++;
+                    atomic_fetch_add(&p->total_replenished, 1);
+                    pthread_mutex_unlock(&ring->lock);
+                } else {
+                    pthread_mutex_unlock(&ring->lock);
+                    if (share.srv_priv) EVP_PKEY_free(share.srv_priv);
+                    break;
+                }
+            }
+        }
+    }
+    return NULL;
+}
+
+static int server_key_pool_init(size_t capacity)
+{
+    if (g_server_pool.initialized) return 0;
+    int n_combos = 0;
+    const AlgoCombo *const *combos = get_active_combos(&n_combos);
+    if (n_combos <= 0 || n_combos > 8) return -1;
+    if (capacity == 0) capacity = DEFAULT_POOL_CAPACITY;
+
+    memset(&g_server_pool, 0, sizeof(g_server_pool));
+    g_server_pool.capacity = capacity;
+    g_server_pool.num_rings = n_combos;
+
+    pthread_mutex_init(&g_server_pool.worker_mutex, NULL);
+    pthread_cond_init(&g_server_pool.refill_cond, NULL);
+
+    printf("[*] Pre-computing server ephemeral key table (%zu capacity/suite)...\n", capacity);
+
+    for (int i = 0; i < n_combos; i++) {
+        ServerKeyRing *ring = &g_server_pool.rings[i];
+        ring->combo = combos[i];
+        ring->capacity = capacity;
+        ring->head = 0;
+        ring->tail = 0;
+        ring->count = 0;
+        pthread_mutex_init(&ring->lock, NULL);
+
+        ring->slots = calloc(ring->capacity, sizeof(ServerKeyShare));
+        if (!ring->slots) return -1;
+
+        struct timespec t0, t1;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+
+        for (size_t s = 0; s < capacity; s++) {
+            ServerKeyShare share;
+            if (generate_server_share(ring->combo, &share) == 0) {
+                ring->slots[ring->tail] = share;
+                ring->tail = (ring->tail + 1) % ring->capacity;
+                ring->count++;
+                atomic_fetch_add(&g_server_pool.total_replenished, 1);
+            }
+        }
+
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        double elapsed_ms = (t1.tv_sec - t0.tv_sec) * 1000.0 + (t1.tv_nsec - t0.tv_nsec) / 1000000.0;
+        printf("  [+] Suite %-2d (%-33s): %zu shares precomputed (%.2f ms total, %.3f ms/share)\n",
+               combos[i]->id, combos[i]->label, ring->count, elapsed_ms, elapsed_ms / (ring->count ? ring->count : 1));
+    }
+
+    g_server_pool.running = 1;
+    if (pthread_create(&g_server_pool.worker_thread, NULL, server_key_pool_worker_loop, &g_server_pool) != 0) {
+        return -1;
+    }
+
+    g_server_pool.initialized = 1;
+    printf("[✔] Server Precomputation Complete: %lu shares ready in RAM (< 1 µs pop)\n\n",
+           (unsigned long)(g_server_pool.num_rings * capacity));
+    return 0;
+}
+
+static int server_key_pool_pop(int combo_id, EVP_PKEY **out_priv, uint8_t *out_pub, size_t *out_pub_len)
+{
+    if (!g_server_pool.initialized) return -1;
+
+    ServerKeyRing *target_ring = NULL;
+    for (int r = 0; r < g_server_pool.num_rings; r++) {
+        if (g_server_pool.rings[r].combo->id == combo_id) {
+            target_ring = &g_server_pool.rings[r];
+            break;
+        }
+    }
+    if (!target_ring) return -1;
+
+    pthread_mutex_lock(&target_ring->lock);
+    if (target_ring->count > 0) {
+        ServerKeyShare share = target_ring->slots[target_ring->head];
+        memset(&target_ring->slots[target_ring->head], 0, sizeof(ServerKeyShare));
+        target_ring->head = (target_ring->head + 1) % target_ring->capacity;
+        target_ring->count--;
+
+        *out_priv = share.srv_priv;
+        memcpy(out_pub, share.srv_pub, share.srv_pub_len);
+        *out_pub_len = share.srv_pub_len;
+
+        atomic_fetch_add(&g_server_pool.total_popped, 1);
+
+        if (target_ring->count < target_ring->capacity / 2) {
+            pthread_cond_signal(&g_server_pool.refill_cond);
+        }
+        pthread_mutex_unlock(&target_ring->lock);
+        return 0;
+    }
+    pthread_mutex_unlock(&target_ring->lock);
+
+    pthread_cond_signal(&g_server_pool.refill_cond);
+    return -1;
+}
+
+static void server_key_pool_destroy(void)
+{
+    if (!g_server_pool.initialized) return;
+
+    g_server_pool.running = 0;
+    pthread_cond_signal(&g_server_pool.refill_cond);
+    pthread_join(g_server_pool.worker_thread, NULL);
+
+    for (int r = 0; r < g_server_pool.num_rings; r++) {
+        ServerKeyRing *ring = &g_server_pool.rings[r];
+        pthread_mutex_lock(&ring->lock);
+        for (size_t s = 0; s < ring->capacity; s++) {
+            if (ring->slots[s].srv_priv) {
+                EVP_PKEY_free(ring->slots[s].srv_priv);
+                ring->slots[s].srv_priv = NULL;
+            }
+        }
+        free(ring->slots);
+        pthread_mutex_unlock(&ring->lock);
+        pthread_mutex_destroy(&ring->lock);
+    }
+    pthread_mutex_destroy(&g_server_pool.worker_mutex);
+    pthread_cond_destroy(&g_server_pool.refill_cond);
+    g_server_pool.initialized = 0;
+}
+
+static void sigint_handler(int sig)
+{
+    (void)sig;
+    server_key_pool_destroy();
+    _exit(0);
+}
+
+/* ─── Client Connection Handler ────────────────────────────────────── */
 
 static void *handle_client(void *arg)
 {
@@ -81,13 +340,22 @@ static void *handle_client(void *arg)
     EVP_PKEY *srv_priv = NULL;
 
     if (combo->classical_curve != CURVE_NONE) {
-        srv_priv = crypto_generate_keypair(combo->classical_curve);
-        if (!srv_priv) { free(cli_pqc_pk); close(fd); return NULL; }
+        int popped = 0;
+        if (g_server_precompute) {
+            if (server_key_pool_pop(combo->id, &srv_priv, srv_pub, &srv_pub_len) == 0) {
+                popped = 1;
+            }
+        }
 
-        if (combo->classical_curve == CURVE_X25519)
-            crypto_export_x25519_pub_raw(srv_priv, srv_pub, &srv_pub_len);
-        else
-            crypto_export_ec_pub_der(srv_priv, srv_pub, &srv_pub_len);
+        if (!popped) {
+            srv_priv = crypto_generate_keypair(combo->classical_curve);
+            if (!srv_priv) { free(cli_pqc_pk); close(fd); return NULL; }
+
+            if (combo->classical_curve == CURVE_X25519)
+                crypto_export_x25519_pub_raw(srv_priv, srv_pub, &srv_pub_len);
+            else
+                crypto_export_ec_pub_der(srv_priv, srv_pub, &srv_pub_len);
+        }
 
         EVP_PKEY *cli_key = (combo->classical_curve == CURVE_X25519)
             ? crypto_load_x25519_pub_raw(cli_pub, c_pub_len)
@@ -131,27 +399,6 @@ static void *handle_client(void *arg)
     if (hybrid_derive_session_key(combo, kdf_type, ecdh_ss, ecdh_ss_len,
                                   kem_ss, kem_ss_len, session_key) != 0) {
         free(ct); free(cli_pqc_pk); close(fd); return NULL;
-    }
-
-    if (combo->id == 9) {
-        static int printed_srv9 = 0;
-        if (!printed_srv9) {
-            printf("\n[Server Debug Suite 9]\n");
-            printf("  c_pub_len=%u | pqc_pk_len=%u | ct_len=%zu\n", c_pub_len, pqc_pk_len, ct_len);
-            printf("  cli_pqc_pk[0..7]: ");
-            for (int i = 0; i < 8 && i < (int)pqc_pk_len; i++) printf("%02x", cli_pqc_pk[i]);
-            printf("\n  ct[0..7]: ");
-            for (int i = 0; i < 8 && i < (int)ct_len; i++) printf("%02x", ct[i]);
-            printf("\n  ecdh_ss[0..7]: ");
-            for (int i = 0; i < 8 && i < (int)ecdh_ss_len; i++) printf("%02x", ecdh_ss[i]);
-            printf("\n  kem_ss[0..7]: ");
-            for (int i = 0; i < 8 && i < (int)kem_ss_len; i++) printf("%02x", kem_ss[i]);
-            printf("\n  session_key[0..7]: ");
-            for (int i = 0; i < 8; i++) printf("%02x", session_key[i]);
-            printf("\n\n");
-            fflush(stdout);
-            printed_srv9 = 1;
-        }
     }
     free(cli_pqc_pk);
 
@@ -210,7 +457,9 @@ static void *handle_client(void *arg)
     static atomic_ulong s_handshake_cnt = 0;
     unsigned long n = atomic_fetch_add(&s_handshake_cnt, 1) + 1;
     if (n % 25 == 0 || n <= 3) {
-        printf("[Server] Handshake #%lu completed: %s (id=%d)\n", n, combo->label, combo->id);
+        printf("[Server] Handshake #%lu completed: %s (id=%d)%s\n",
+               n, combo->label, combo->id,
+               g_server_precompute ? " [Pool Hit]" : "");
         fflush(stdout);
     }
 
@@ -218,12 +467,56 @@ static void *handle_client(void *arg)
     return NULL;
 }
 
-int main(void)
+/* ─── Main ─────────────────────────────────────────────────────────── */
+
+int main(int argc, char *argv[])
 {
+    int port = SERVER_PORT;
+    const char *host = SERVER_HOST;
+
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--precompute") == 0 || strcmp(argv[i], "-p") == 0) {
+            g_server_precompute = 1;
+        } else if (strcmp(argv[i], "--capacity") == 0 || strcmp(argv[i], "-c") == 0) {
+            if (i + 1 < argc) {
+                g_pool_capacity = (size_t)atoi(argv[++i]);
+                if (g_pool_capacity == 0) g_pool_capacity = DEFAULT_POOL_CAPACITY;
+            }
+        } else if (strcmp(argv[i], "--port") == 0 || strcmp(argv[i], "-P") == 0) {
+            if (i + 1 < argc) {
+                port = atoi(argv[++i]);
+            }
+        } else if (strcmp(argv[i], "--host") == 0 || strcmp(argv[i], "-H") == 0) {
+            if (i + 1 < argc) {
+                host = argv[++i];
+            }
+        } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            printf("Usage: %s [OPTIONS]\n", argv[0]);
+            printf("  --precompute, -p        Precompute server ephemeral key table before listening\n");
+            printf("  --capacity <N>, -c <N>  Capacity per suite (default: %d)\n", DEFAULT_POOL_CAPACITY);
+            printf("  --port <PORT>, -P <PORT>Listen port (default: %d)\n", SERVER_PORT);
+            printf("  --host <HOST>, -H <HOST>Listen host (default: %s)\n", SERVER_HOST);
+            printf("  --help, -h              Show this help message\n");
+            return 0;
+        }
+    }
+
+    signal(SIGINT, sigint_handler);
+    signal(SIGTERM, sigint_handler);
+
     printf("\n═══════════════════════════════════════════════════════\n");
     printf("  Sequential Hybrid PQC TLS 1.3 Server (Wire V2)      \n");
-    printf("  Port: %d | Host: %s\n", SERVER_PORT, SERVER_HOST);
+    printf("  Port: %d | Host: %s\n", port, host);
+    printf("  Precomputation: %s\n",
+           g_server_precompute ? "ENABLED (Ephemeral Key Pool Active)" : "DISABLED (Inline Server Keygen)");
     printf("═══════════════════════════════════════════════════════\n\n");
+
+    if (g_server_precompute) {
+        if (server_key_pool_init(g_pool_capacity) != 0) {
+            fprintf(stderr, "[!] Failed to initialize server key pool.\n");
+            return 1;
+        }
+    }
 
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd < 0) { perror("socket"); return 1; }
@@ -233,8 +526,8 @@ int main(void)
 
     struct sockaddr_in addr = {
         .sin_family      = AF_INET,
-        .sin_addr.s_addr = INADDR_ANY,
-        .sin_port        = htons(SERVER_PORT)
+        .sin_addr.s_addr = inet_addr(host),
+        .sin_port        = htons(port)
     };
 
     if (bind(server_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
@@ -244,7 +537,7 @@ int main(void)
         perror("listen"); return 1;
     }
 
-    printf("[*] Server listening on %s:%d\n\n", SERVER_HOST, SERVER_PORT);
+    printf("[*] Server listening on %s:%d\n\n", host, port);
 
     while (1) {
         struct sockaddr_in cli_addr;
@@ -267,5 +560,6 @@ int main(void)
     }
 
     close(server_fd);
+    server_key_pool_destroy();
     return 0;
 }
