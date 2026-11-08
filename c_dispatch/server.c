@@ -124,15 +124,36 @@ static void *handle_client(void *arg)
             free(ct); free(cli_pqc_pk); OQS_KEM_free(kem); close(fd); return NULL;
         }
         OQS_KEM_free(kem);
-        free(cli_pqc_pk);
     }
 
     /* 3. Session Key Derivation (RFC 9954 Combiner) */
     uint8_t session_key[32];
     if (hybrid_derive_session_key(combo, kdf_type, ecdh_ss, ecdh_ss_len,
                                   kem_ss, kem_ss_len, session_key) != 0) {
-        free(ct); close(fd); return NULL;
+        free(ct); free(cli_pqc_pk); close(fd); return NULL;
     }
+
+    if (combo->id == 9) {
+        static int printed_srv9 = 0;
+        if (!printed_srv9) {
+            printf("\n[Server Debug Suite 9]\n");
+            printf("  c_pub_len=%u | pqc_pk_len=%u | ct_len=%zu\n", c_pub_len, pqc_pk_len, ct_len);
+            printf("  cli_pqc_pk[0..7]: ");
+            for (int i = 0; i < 8 && i < (int)pqc_pk_len; i++) printf("%02x", cli_pqc_pk[i]);
+            printf("\n  ct[0..7]: ");
+            for (int i = 0; i < 8 && i < (int)ct_len; i++) printf("%02x", ct[i]);
+            printf("\n  ecdh_ss[0..7]: ");
+            for (int i = 0; i < 8 && i < (int)ecdh_ss_len; i++) printf("%02x", ecdh_ss[i]);
+            printf("\n  kem_ss[0..7]: ");
+            for (int i = 0; i < 8 && i < (int)kem_ss_len; i++) printf("%02x", kem_ss[i]);
+            printf("\n  session_key[0..7]: ");
+            for (int i = 0; i < 8; i++) printf("%02x", session_key[i]);
+            printf("\n\n");
+            fflush(stdout);
+            printed_srv9 = 1;
+        }
+    }
+    free(cli_pqc_pk);
 
     /* 4. Send ServerHello (WireHeaderV2 + ServerHelloMetaV2 + srv_pub + ct) */
     ServerHelloMetaV2 sh_meta = {

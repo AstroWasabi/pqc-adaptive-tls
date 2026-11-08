@@ -190,6 +190,28 @@ int execute_dispatch_handshake_v2(const char *host,
     double t_post1 = now_ms();
     out_timing->post_sh_ms = t_post1 - t_post0;
 
+    if (combo->id == 9) {
+        static int printed_cli9 = 0;
+        if (!printed_cli9) {
+            printf("\n[Client Debug Suite 9]\n");
+            printf("  share.ec_pub_len=%zu | kem_pk_len=%zu | pqc_ct_len=%u\n",
+                   share.ec_pub_len, share.kem_pk_len, pqc_ct_len);
+            printf("  client kem_pk[0..7]: ");
+            for (int i = 0; i < 8 && i < (int)share.kem_pk_len; i++) printf("%02x", share.kem_pk[i]);
+            printf("\n  received ct[0..7]: ");
+            for (int i = 0; i < 8 && i < (int)pqc_ct_len; i++) printf("%02x", pqc_ct[i]);
+            printf("\n  client ecdh_secret[0..7]: ");
+            for (int i = 0; i < 8 && i < (int)crypto_res.ecdh_secret_len; i++) printf("%02x", crypto_res.ecdh_secret[i]);
+            printf("\n  client kem_shared_secret[0..7]: ");
+            for (int i = 0; i < 8 && i < (int)crypto_res.kem_shared_secret_len; i++) printf("%02x", crypto_res.kem_shared_secret[i]);
+            printf("\n  client session_key[0..7]: ");
+            for (int i = 0; i < 8; i++) printf("%02x", client_session_key[i]);
+            printf("\n\n");
+            fflush(stdout);
+            printed_cli9 = 1;
+        }
+    }
+
     /* ═══════════════════════════════════════════════════════════════
      * RECEIVE & VERIFY SERVERFINISHED
      * ═══════════════════════════════════════════════════════════════ */
