@@ -97,7 +97,7 @@ ALL_COMMON := $(DISPATCH_OBJS) $(BLAKE3_OBJS) $(CJSON_OBJS)
 # ─── Targets ─────────────────────────────────────────────────────
 .PHONY: all clean test test-asan test-tsan
 
-all: server bench_e2e benchmark_suite bench_prims test_key_pool
+all: server bench_e2e benchmark_suite bench_prims test_key_pool test_hybrid_kem
 	@echo ""
 	@echo "═══════════════════════════════════════════════════════"
 	@echo "  Build complete (Linux):"
@@ -106,6 +106,7 @@ all: server bench_e2e benchmark_suite bench_prims test_key_pool
 	@echo "    ./benchmark_suite  — Local Handshake Benchmark"
 	@echo "    ./bench_prims      — Cryptographic Primitives Benchmark"
 	@echo "    ./test_key_pool    — Key Pool Unit Test"
+	@echo "    ./test_hybrid_kem  — Hybrid KEM Verification Test"
 	@echo "═══════════════════════════════════════════════════════"
 
 server: server.o $(ALL_COMMON)
@@ -126,12 +127,19 @@ tests/test_key_pool.o: tests/test_key_pool.c
 test_key_pool: tests/test_key_pool.o $(ALL_COMMON)
 	$(CC) -o $@ $^ $(LDFLAGS)
 
-test: test_key_pool
+tests/test_hybrid_kem.o: tests/test_hybrid_kem.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+test_hybrid_kem: tests/test_hybrid_kem.o $(ALL_COMMON)
+	$(CC) -o $@ $^ $(LDFLAGS)
+
+test: test_key_pool test_hybrid_kem
 	@echo "Running tests..."
 	./test_key_pool
+	./test_hybrid_kem
 
 clean:
-	rm -f server bench_e2e benchmark_suite bench_prims test_key_pool
+	rm -f server bench_e2e benchmark_suite bench_prims test_key_pool test_hybrid_kem
 	rm -f *.o src/*.o tests/*.o $(BLAKE3_DIR)/*.o $(CJSON_DIR)/*.o
 	rm -f host_profile.json benchmark_results.json e2e_benchmark_results.json
 	rm -f *.log

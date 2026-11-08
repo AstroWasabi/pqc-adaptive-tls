@@ -207,7 +207,20 @@ int execute_dispatch_handshake_v2(const char *host,
     crypto_key_confirm_tag(client_session_key, "server finished", expected_tag);
 
     if (CRYPTO_memcmp(srv_tag, expected_tag, 32) != 0) {
-        fprintf(stderr, "[!] Key confirmation HMAC mismatch!\n");
+        static int printed_mismatch = 0;
+        if (!printed_mismatch) {
+            fprintf(stderr, "\n[!] Key confirmation HMAC mismatch on %s (id=%d)!\n",
+                    combo->label, combo->id);
+            fprintf(stderr, "    Expected tag: ");
+            for (int i = 0; i < 8; i++) fprintf(stderr, "%02x", expected_tag[i]);
+            fprintf(stderr, " | Server tag: ");
+            for (int i = 0; i < 8; i++) fprintf(stderr, "%02x", srv_tag[i]);
+            fprintf(stderr, "\n");
+            fprintf(stderr, "    Client session key: ");
+            for (int i = 0; i < 8; i++) fprintf(stderr, "%02x", client_session_key[i]);
+            fprintf(stderr, "\n");
+            printed_mismatch = 1;
+        }
         close(fd); return -1;
     }
 

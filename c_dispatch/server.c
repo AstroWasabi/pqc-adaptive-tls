@@ -26,6 +26,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 #include <time.h>
+#include <stdatomic.h>
 
 #include "include/algo_config.h"
 #include "include/crypto_engine.h"
@@ -184,6 +185,14 @@ static void *handle_client(void *arg)
     memcpy(fin_pkt + sizeof(fin_hdr), confirm_tag, 32);
 
     send_all(fd, fin_pkt, sizeof(fin_pkt));
+
+    static atomic_ulong s_handshake_cnt = 0;
+    unsigned long n = atomic_fetch_add(&s_handshake_cnt, 1) + 1;
+    if (n % 25 == 0 || n <= 3) {
+        printf("[Server] Handshake #%lu completed: %s (id=%d)\n", n, combo->label, combo->id);
+        fflush(stdout);
+    }
+
     close(fd);
     return NULL;
 }
