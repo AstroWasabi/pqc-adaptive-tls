@@ -10,6 +10,7 @@
 #include <time.h>
 #include <unistd.h>
 #include "../include/key_pool.h"
+#include "../include/engine.h"
 #include "../include/algo_config.h"
 #include "../include/crypto_engine.h"
 
