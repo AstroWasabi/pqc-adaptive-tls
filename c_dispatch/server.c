@@ -166,8 +166,13 @@ static void *server_key_pool_worker_loop(void *arg)
 static int server_key_pool_init(size_t capacity)
 {
     if (g_server_pool.initialized) return 0;
+    const AlgoCombo *combos[8];
     int n_combos = 0;
-    const AlgoCombo *const *combos = get_active_combos(&n_combos);
+    for (int i = 0; i < NUM_ALGO_COMBOS; i++) {
+        if (ALGORITHM_COMBOS[i].profile == PROFILE_HYBRID) {
+            combos[n_combos++] = &ALGORITHM_COMBOS[i];
+        }
+    }
     if (n_combos <= 0 || n_combos > 8) return -1;
     if (capacity == 0) capacity = DEFAULT_POOL_CAPACITY;
 
