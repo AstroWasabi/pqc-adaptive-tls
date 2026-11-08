@@ -168,6 +168,12 @@ int execute_dispatch_handshake_v2(const char *host,
         }
     }
 
+    /* Save debug prefixes for diagnosis */
+    uint8_t dbg_client_pk[8] = {0};
+    if (share.kem_pk && share.kem_pk_len >= 8) memcpy(dbg_client_pk, share.kem_pk, 8);
+    uint8_t dbg_client_ct[8] = {0};
+    if (pqc_ct && pqc_ct_len >= 8) memcpy(dbg_client_ct, pqc_ct, 8);
+
     /* ═══════════════════════════════════════════════════════════════
      * PHASE B: Interactive Key Derivation (ECDH Derive || KEM Decaps)
      * ═══════════════════════════════════════════════════════════════ */
@@ -190,28 +196,6 @@ int execute_dispatch_handshake_v2(const char *host,
     double t_post1 = now_ms();
     out_timing->post_sh_ms = t_post1 - t_post0;
 
-    if (combo->id == 9) {
-        static int printed_cli9 = 0;
-        if (!printed_cli9) {
-            printf("\n[Client Debug Suite 9]\n");
-            printf("  share.ec_pub_len=%zu | kem_pk_len=%zu | pqc_ct_len=%u\n",
-                   share.ec_pub_len, share.kem_pk_len, pqc_ct_len);
-            printf("  client kem_pk[0..7]: ");
-            for (int i = 0; i < 8 && i < (int)share.kem_pk_len; i++) printf("%02x", share.kem_pk[i]);
-            printf("\n  received ct[0..7]: ");
-            for (int i = 0; i < 8 && i < (int)pqc_ct_len; i++) printf("%02x", pqc_ct[i]);
-            printf("\n  client ecdh_secret[0..7]: ");
-            for (int i = 0; i < 8 && i < (int)crypto_res.ecdh_secret_len; i++) printf("%02x", crypto_res.ecdh_secret[i]);
-            printf("\n  client kem_shared_secret[0..7]: ");
-            for (int i = 0; i < 8 && i < (int)crypto_res.kem_shared_secret_len; i++) printf("%02x", crypto_res.kem_shared_secret[i]);
-            printf("\n  client session_key[0..7]: ");
-            for (int i = 0; i < 8; i++) printf("%02x", client_session_key[i]);
-            printf("\n\n");
-            fflush(stdout);
-            printed_cli9 = 1;
-        }
-    }
-
     /* ═══════════════════════════════════════════════════════════════
      * RECEIVE & VERIFY SERVERFINISHED
      * ═══════════════════════════════════════════════════════════════ */
@@ -233,14 +217,21 @@ int execute_dispatch_handshake_v2(const char *host,
         if (!printed_mismatch) {
             fprintf(stderr, "\n[!] Key confirmation HMAC mismatch on %s (id=%d)!\n",
                     combo->label, combo->id);
-            fprintf(stderr, "    Expected tag: ");
+            fprintf(stderr, "    Client kem_pk[0..7]: ");
+            for (int i = 0; i < 8; i++) fprintf(stderr, "%02x", dbg_client_pk[i]);
+            fprintf(stderr, "\n    Received ct[0..7]:   ");
+            for (int i = 0; i < 8; i++) fprintf(stderr, "%02x", dbg_client_ct[i]);
+            fprintf(stderr, "\n    Client ecdh_ss[0..7]: ");
+            for (int i = 0; i < 8; i++) fprintf(stderr, "%02x", crypto_res.ecdh_secret[i]);
+            fprintf(stderr, "\n    Client kem_ss[0..7]:  ");
+            for (int i = 0; i < 8; i++) fprintf(stderr, "%02x", crypto_res.kem_shared_secret[i]);
+            fprintf(stderr, "\n    Client session_key:   ");
+            for (int i = 0; i < 8; i++) fprintf(stderr, "%02x", client_session_key[i]);
+            fprintf(stderr, "\n    Expected tag:         ");
             for (int i = 0; i < 8; i++) fprintf(stderr, "%02x", expected_tag[i]);
             fprintf(stderr, " | Server tag: ");
             for (int i = 0; i < 8; i++) fprintf(stderr, "%02x", srv_tag[i]);
-            fprintf(stderr, "\n");
-            fprintf(stderr, "    Client session key: ");
-            for (int i = 0; i < 8; i++) fprintf(stderr, "%02x", client_session_key[i]);
-            fprintf(stderr, "\n");
+            fprintf(stderr, "\n\n");
             printed_mismatch = 1;
         }
         close(fd); return -1;
