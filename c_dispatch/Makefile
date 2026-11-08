@@ -4,11 +4,8 @@
 # Adaptive Client-Side Parallel Hybrid Post-Quantum TLS 1.3
 # ═══════════════════════════════════════════════════════════════════
 
-# ─── liboqs detection (Standard Linux /usr, /usr/local, or custom) ───
-LIBOQS_DIR ?= $(wildcard /home/sudoroot/_oqs)
-ifeq ($(LIBOQS_DIR),)
-  LIBOQS_DIR := $(wildcard /usr/local)
-endif
+# ─── liboqs detection (Standard Linux /usr, /usr/local, or user dirs) ───
+LIBOQS_DIR ?= $(firstword $(wildcard /home/pharsyde0/oqs /home/sudoroot/_oqs /home/pharsyde0/_oqs /usr/local /usr))
 ifeq ($(LIBOQS_DIR),)
   LIBOQS_DIR := /usr
 endif
