@@ -49,8 +49,8 @@ int main(void)
         /* 1. On-Demand Inline Keygen */
         double t0 = now_us();
         ClientKeyShare inline_share;
-        int dummy = 0;
-        key_pool_pop(NULL, &inline_share, &dummy); /* Forces inline */
+        int fell_back = 0;
+        engine_client_keygen(combo, ROUTE_SEQUENTIAL, &inline_share, &fell_back);
         double t1 = now_us();
         double inline_us = t1 - t0;
         client_key_share_free(&inline_share);
