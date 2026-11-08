@@ -133,28 +133,46 @@ def plot_figure1_phase_a():
     inline_prep = [DATA["baseline"][k]["Strict_Sequential"]["ch_prep"] for k in SUITE_KEYS]
     precomp_prep = [DATA["precomputed"][k]["Strict_Sequential"]["ch_prep"] for k in SUITE_KEYS]
 
-    fig, ax = plt.subplots(figsize=(9, 4.8), dpi=150)
+    fig, ax = plt.subplots(figsize=(10, 5.5), dpi=150)
     rects1 = ax.bar(x - width/2, inline_prep, width, label='Baseline (Inline Keygen)',
                     color='#d9534f', edgecolor='#333333', linewidth=0.8)
     rects2 = ax.bar(x + width/2, precomp_prep, width, label='Precomputed Dual Key Pool (Ours)',
                     color='#2b8a3e', edgecolor='#333333', linewidth=0.8)
 
+    # 1. Exact latency values on top of Baseline (Red) bars
+    for bar in rects1:
+        h = bar.get_height()
+        ax.annotate(f"{h:.3f} ms",
+                    xy=(bar.get_x() + bar.get_width()/2, h),
+                    xytext=(0, 4), textcoords="offset points",
+                    ha='center', va='bottom', fontsize=8.5, fontweight='bold', color='#962d29')
+
+    # 2. Exact latency values on top of Precomputed (Green) bars
+    for bar in rects2:
+        h = bar.get_height()
+        ax.annotate(f"{h:.3f} ms",
+                    xy=(bar.get_x() + bar.get_width()/2, h),
+                    xytext=(0, 4), textcoords="offset points",
+                    ha='center', va='bottom', fontsize=8.5, fontweight='bold', color='#1e5622')
+
+    # 3. Speedup factor badges above each suite pair
+    for i in range(len(SUITE_KEYS)):
+        speedup = inline_prep[i] / precomp_prep[i]
+        top = max(inline_prep[i], precomp_prep[i])
+        ax.annotate(f"{speedup:.1f}x speedup",
+                    xy=(x[i], top),
+                    xytext=(0, 20), textcoords="offset points",
+                    ha='center', va='bottom', fontsize=8.5, fontweight='bold', color='#1e5622',
+                    bbox=dict(boxstyle="round,pad=0.25", fc="#ebfbee", ec="#2b8a3e", lw=0.8))
+
+    ax.set_ylim(0, 3.4)
     ax.set_ylabel('Client Preparation Latency (ms)', fontsize=11, fontweight='bold')
     ax.set_title('Figure 1: Phase A ClientHello Prep Latency (Inline vs. Dual Key Pool)',
                  fontsize=13, fontweight='bold', pad=14)
     ax.set_xticks(x)
     ax.set_xticklabels(SUITE_LABELS, fontsize=10)
-    ax.legend(frameon=True, facecolor='#ffffff', edgecolor='#cccccc', fontsize=10)
+    ax.legend(frameon=True, facecolor='#ffffff', edgecolor='#cccccc', fontsize=10, loc='upper left')
     ax.grid(axis='y', linestyle='--', alpha=0.7)
-
-    # Annotate speedup factors
-    for i in range(len(SUITE_KEYS)):
-        speedup = inline_prep[i] / precomp_prep[i]
-        ax.annotate(f"{speedup:.1f}x faster\n({inline_prep[i]:.2f}ms to {precomp_prep[i]*1000:.0f}us)",
-                    xy=(x[i] + width/2, precomp_prep[i]),
-                    xytext=(x[i] + 0.05, inline_prep[i] * 0.75 if inline_prep[i] > 1.0 else inline_prep[i] + 0.15),
-                    fontsize=8.5, fontweight='bold', color='#1e5622',
-                    bbox=dict(boxstyle="round,pad=0.25", fc="#ebfbee", ec="#2b8a3e", lw=0.8))
 
     plt.tight_layout()
     plt.savefig('fig1_phase_a_precompute.png', dpi=300)
