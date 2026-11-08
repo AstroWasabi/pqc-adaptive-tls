@@ -1,123 +1,83 @@
 /* c_dispatch/include/engine.h
- * Phase 3: The Execution Engine
+ * ═══════════════════════════════════════════════════════════════════
+ * Adaptive Execution Engine for Hybrid Post-Quantum TLS 1.3
  *
- * Provides two execution strategies for TLS 1.3 hybrid PQC:
+ * Implements two distinct critical path phases:
  *
- * 1. execute_sequential()
- *    Runs ECDH_Derive then ML_KEM_Op back-to-back on the calling thread.
- *    Guarantees zero OS scheduler overhead and preserves L1 cache locality.
+ * Phase A: engine_client_keygen()
+ *   - Classical EC Keygen || PQC KEM Keygen
+ *   - Bypassed entirely when Key Pool has a ready-to-use share!
  *
- * 2. execute_parallel_optimized()
- *    Uses a persistent, pre-warmed worker thread pinned to Core 1.
- *    Main thread (Core 0) computes ECDH while worker computes KEM.
- *    Synchronisation via pthread_cond_t for instant wake.
- *
- * Protocol Alignment (RFC 9954):
- *   Client path: ECDH_Derive || ML_KEM_Decapsulate
- *   Server path: ECDH_Derive || ML_KEM_Encapsulate
+ * Phase B: engine_client_finish()
+ *   - Classical ECDH Derive || PQC KEM Decapsulate
+ *   - Overlaps curve scalar multiplication with heavy KEM math.
+ * ═══════════════════════════════════════════════════════════════════
  */
 
 #ifndef ENGINE_H
 #define ENGINE_H
 
 #include "algo_config.h"
+#include "key_pool.h"
 #include <stddef.h>
 #include <stdint.h>
 
-/* -----------------------------------------------------------------------
- * TLS 1.3 Handshake Role (determines KEM operation)
- * ----------------------------------------------------------------------- */
-
 typedef enum {
-    ROLE_CLIENT,   /* ECDH_Derive || ML_KEM_Decapsulate */
-    ROLE_SERVER    /* ECDH_Derive || ML_KEM_Encapsulate */
-} HandshakeRole;
+    ROUTE_SEQUENTIAL,   /* Execute inline on calling thread */
+    ROUTE_PARALLEL      /* Execute with core-pinned persistent worker */
+} DispatchRoute;
 
-/* -----------------------------------------------------------------------
- * Shared result struct — joined after parallel execution
- * ----------------------------------------------------------------------- */
-
+/* Output results of Phase B (Shared Secret Derivation) */
 typedef struct {
-    uint8_t  ecdh_secret[48];          /* Max P-384 shared secret = 48 bytes */
+    uint8_t  ecdh_secret[48];          /* Classical shared secret */
     size_t   ecdh_secret_len;
-    uint8_t  kem_shared_secret[64];    /* ML-KEM shared secret              */
+    uint8_t  kem_shared_secret[64];    /* KEM shared secret */
     size_t   kem_shared_secret_len;
-    int      ecdh_ok;                  /* 1 = ECDH derivation succeeded     */
-    int      kem_ok;                   /* 1 = KEM operation succeeded       */
+    int      ecdh_ok;
+    int      kem_ok;
+    int      fell_back;                /* 1 if parallel fell back to sequential */
 } SharedCryptoResult;
 
-/* -----------------------------------------------------------------------
- * Affinity verification probe
- * ----------------------------------------------------------------------- */
-
 typedef struct {
-    int  main_thread_cpu;      /* CPU core ID of main thread (sched_getcpu) */
-    int  worker_thread_cpu;    /* CPU core ID of worker thread              */
-    long main_thread_tid;      /* OS thread ID of main thread               */
-    long worker_thread_tid;    /* OS thread ID of worker thread             */
+    int  main_thread_cpu;
+    long main_thread_tid;
+    int  worker_thread_cpu;
+    long worker_thread_tid;
 } AffinityProbe;
 
-/* -----------------------------------------------------------------------
- * Lifecycle
- * ----------------------------------------------------------------------- */
-
-/**
- * Initialize the persistent worker pool.
- * Creates one pre-warmed worker thread pinned to Core 1.
- * Must be called once before execute_parallel_optimized().
- *
- * @returns  0 on success, -1 on failure
- */
-int engine_init(void);
-
-/**
- * Shut down the worker pool and join the worker thread.
- */
+int  engine_init(void);
 void engine_shutdown(void);
-
-/* -----------------------------------------------------------------------
- * Execution Strategies
- * ----------------------------------------------------------------------- */
+int  verify_affinity(AffinityProbe *probe);
 
 /**
- * Sequential execution: ECDH then KEM on the calling thread.
- * Preserves L1 cache locality. Zero context-switch overhead.
+ * Phase A: Generate a fresh client key share (EC keypair + KEM keypair).
  *
- * @param combo   Cipher suite descriptor
- * @param role    CLIENT or SERVER (selects encaps vs decaps)
- * @param result  Output struct for shared secrets
- * @returns       0 on success, -1 on failure
+ * @param combo      Cipher suite descriptor
+ * @param route      ROUTE_SEQUENTIAL or ROUTE_PARALLEL
+ * @param out_share  Output key share
+ * @param fell_back  Output fallback flag
+ * @returns          0 on success, -1 on failure
  */
-int execute_sequential(const AlgoCombo *combo, HandshakeRole role,
-                       SharedCryptoResult *result);
+int engine_client_keygen(const AlgoCombo *combo, DispatchRoute route,
+                         ClientKeyShare *out_share, int *fell_back);
 
 /**
- * Parallel execution with core-pinned worker.
- * Main thread (Core 0): ECDH keygen + derive.
- * Worker thread (Core 1): KEM keygen + encaps/decaps.
- * Results joined via SharedCryptoResult.
+ * Phase B: Finish key exchange (Derive ECDH secret and Decapsulate KEM).
  *
- * Requires engine_init() to have been called.
- *
- * @param combo   Cipher suite descriptor
- * @param role    CLIENT or SERVER
- * @param result  Output struct for shared secrets
- * @returns       0 on success, -1 on failure
+ * @param combo        Cipher suite descriptor
+ * @param route        ROUTE_SEQUENTIAL or ROUTE_PARALLEL
+ * @param ks           Client's key share from Phase A
+ * @param srv_pub      Server's classical public key
+ * @param srv_pub_len  Length of server's classical public key
+ * @param ct           Server's PQC ciphertext
+ * @param ct_len       Length of ciphertext
+ * @param out_result   Output derived shared secrets
+ * @returns            0 on success, -1 on failure
  */
-int execute_parallel_optimized(const AlgoCombo *combo, HandshakeRole role,
-                               SharedCryptoResult *result);
-
-/* -----------------------------------------------------------------------
- * Verification
- * ----------------------------------------------------------------------- */
-
-/**
- * Probe the current core assignments of main + worker threads.
- * Uses sched_getcpu() and SYS_gettid to populate the AffinityProbe.
- *
- * @param probe  Output struct
- * @returns      0 on success, -1 if engine not initialised
- */
-int verify_affinity(AffinityProbe *probe);
+int engine_client_finish(const AlgoCombo *combo, DispatchRoute route,
+                         const ClientKeyShare *ks,
+                         const uint8_t *srv_pub, size_t srv_pub_len,
+                         const uint8_t *ct, size_t ct_len,
+                         SharedCryptoResult *out_result);
 
 #endif /* ENGINE_H */

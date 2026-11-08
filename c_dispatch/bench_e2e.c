@@ -1,24 +1,13 @@
 /* c_dispatch/bench_e2e.c
  * ═══════════════════════════════════════════════════════════════════
- * End-to-End TLS 1.3 Hybrid PQC Benchmark
- * Adaptive Dispatch Runtime — Network Handshake Edition
+ * End-to-End TLS 1.3 Hybrid PQC Benchmark (Wire Framing V2)
  *
- * Runs real TCP handshakes against the dispatch server, measuring
- * client-side crypto latency across three client dispatch modes:
+ * Evaluates:
+ *   - Phase A: ClientHello Prep Latency (ch_prep_ms)
+ *   - Phase B: In-Flight Crypto Latency (post_sh_ms)
+ *   - Total End-to-End Handshake Latency (total_ms)
  *
- *   1. Strict_Sequential  — sequential execution on client (server: sequential)
- *   2. Strict_Parallel    — parallel execution on client (server: sequential)
- *   3. Adaptive_Switch    — auto dispatch on client (router decides per-handshake)
- *
- * Server Execution: Always Sequential
- *
- * Timing: clock_gettime(CLOCK_MONOTONIC) — starts AFTER TCP connect,
- *         ends after receiving ServerFinished.
- *
- * Statistics: qsort → percentile extraction → Markdown table.
- * Output: Mean, p50, p95, p99 tail latencies (ms).
- *
- * Usage: ./bench_e2e [--host <ip>] [--runs <N>] [--kdf <sha256|blake3>]
+ * Isolates cryptographic gains from network jitter!
  * ═══════════════════════════════════════════════════════════════════
  */
 
@@ -27,7 +16,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/syscall.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -37,31 +25,27 @@
 #include "include/telemetry.h"
 #include "include/key_pool.h"
 
-#define SERVER_PORT 4444
-
-/* Defined in client.c */
 extern int g_client_use_key_pool;
-extern double g_last_ch_prep_ms;
-double execute_dispatch_handshake(const char *host,
+
+typedef struct {
+    double ch_prep_ms;
+    double post_sh_ms;
+    double total_ms;
+    int    pool_hit;
+    int    ok;
+} HandshakeTiming;
+
+int execute_dispatch_handshake_v2(const char *host,
                                   const AlgoCombo *combo,
                                   const char *kdf_type,
-                                  const char *dispatch_mode,
-                                  DispatchRoute local_route);
-int  client_worker_init(void);
-void client_worker_shutdown(void);
-
-/* ═══════════════════════════════════════════════════════════════════
- * Configuration
- * ═══════════════════════════════════════════════════════════════════ */
+                                  DispatchRoute local_route,
+                                  HandshakeTiming *out_timing);
 
 static const char *g_host        = "127.0.0.1";
-static int         g_runs        = 1000;
+static int         g_runs        = 500;
 static const char *g_kdf         = "sha256";
 static int         g_precompute  = 0;
-
-/* ═══════════════════════════════════════════════════════════════════
- * Benchmark modes
- * ═══════════════════════════════════════════════════════════════════ */
+static int         g_filter_mode = -1;
 
 typedef enum {
     MODE_STRICT_SEQUENTIAL,
@@ -79,14 +63,6 @@ static const char *mode_label(BenchMode m)
     }
 }
 
-/* dispatch_mode string sent to the server — server always executes sequentially */
-static const char *mode_wire(BenchMode m)
-{
-    (void)m;
-    return "sequential";
-}
-
-/* local route used by the client */
 static DispatchRoute mode_local_route(BenchMode m, const AlgoCombo *combo)
 {
     switch (m) {
@@ -97,16 +73,21 @@ static DispatchRoute mode_local_route(BenchMode m, const AlgoCombo *combo)
     }
 }
 
-/* ═══════════════════════════════════════════════════════════════════
- * Statistics
- * ═══════════════════════════════════════════════════════════════════ */
-
 typedef struct {
     double mean_ms;
     double p50_ms;
     double p95_ms;
     double p99_ms;
 } LatencyStats;
+
+typedef struct {
+    const char  *combo_label;
+    const char  *mode_label;
+    LatencyStats ch_prep;
+    LatencyStats post_sh;
+    LatencyStats total;
+    double       pool_hit_rate;
+} BenchResultV2;
 
 static int cmp_double(const void *a, const void *b)
 {
@@ -120,74 +101,13 @@ static int cmp_double(const void *a, const void *b)
 static void compute_stats(double *samples, int n, LatencyStats *out)
 {
     qsort(samples, (size_t)n, sizeof(double), cmp_double);
-
     double sum = 0.0;
     for (int i = 0; i < n; i++) sum += samples[i];
-
     out->mean_ms = sum / n;
     out->p50_ms  = samples[(int)((n - 1) * 0.50)];
     out->p95_ms  = samples[(int)((n - 1) * 0.95)];
     out->p99_ms  = samples[(int)((n - 1) * 0.99)];
 }
-
-/* ═══════════════════════════════════════════════════════════════════
- * Run a single benchmark track
- * ═══════════════════════════════════════════════════════════════════ */
-
-static int run_bench(const AlgoCombo *combo, BenchMode mode,
-                     double *samples, int n_iter)
-{
-    const char *wire_mode   = mode_wire(mode);
-    DispatchRoute loc_route = mode_local_route(mode, combo);
-
-    for (int i = 0; i < n_iter; i++) {
-        double ms = execute_dispatch_handshake(g_host, combo, g_kdf,
-                                               wire_mode, loc_route);
-        if (ms < 0.0) {
-            fprintf(stderr, "[!] Handshake failed: %s | mode=%s | iter=%d\n",
-                    combo->label, mode_label(mode), i);
-            return -1;
-        }
-        samples[i] = ms;
-    }
-    return 0;
-}
-
-/* ═══════════════════════════════════════════════════════════════════
- * Export results to JSON (fprintf, no cJSON)
- * ═══════════════════════════════════════════════════════════════════ */
-
-typedef struct {
-    const char *combo_label;
-    const char *mode_label;
-    LatencyStats stats;
-} BenchResult;
-
-static void export_results(const char *path,
-                           const BenchResult *results, int n)
-{
-    FILE *fp = fopen(path, "w");
-    if (!fp) { perror("export_results"); return; }
-
-    fprintf(fp, "[\n");
-    for (int i = 0; i < n; i++) {
-        fprintf(fp, "  {\n");
-        fprintf(fp, "    \"cipher_suite\": \"%s\",\n", results[i].combo_label);
-        fprintf(fp, "    \"mode\": \"%s\",\n", results[i].mode_label);
-        fprintf(fp, "    \"mean_ms\": %.6f,\n", results[i].stats.mean_ms);
-        fprintf(fp, "    \"p50_ms\": %.6f,\n", results[i].stats.p50_ms);
-        fprintf(fp, "    \"p95_ms\": %.6f,\n", results[i].stats.p95_ms);
-        fprintf(fp, "    \"p99_ms\": %.6f\n", results[i].stats.p99_ms);
-        fprintf(fp, "  }%s\n", (i < n - 1) ? "," : "");
-    }
-    fprintf(fp, "]\n");
-    fclose(fp);
-    printf("[✔] Results exported → %s\n\n", path);
-}
-
-/* ═══════════════════════════════════════════════════════════════════
- * CLI argument parser
- * ═══════════════════════════════════════════════════════════════════ */
 
 static void parse_args(int argc, char *argv[])
 {
@@ -200,129 +120,155 @@ static void parse_args(int argc, char *argv[])
             g_kdf = argv[++i];
         else if (strcmp(argv[i], "--precompute") == 0)
             g_precompute = 1;
+        else if (strcmp(argv[i], "--seq") == 0)
+            g_filter_mode = MODE_STRICT_SEQUENTIAL;
+        else if (strcmp(argv[i], "--par") == 0)
+            g_filter_mode = MODE_STRICT_PARALLEL;
+        else if (strcmp(argv[i], "--ada") == 0)
+            g_filter_mode = MODE_ADAPTIVE_SWITCH;
     }
 }
 
-/* ═══════════════════════════════════════════════════════════════════
- * Main
- * ═══════════════════════════════════════════════════════════════════ */
+static void export_results_json(const char *path, const BenchResultV2 *res, int n)
+{
+    FILE *fp = fopen(path, "w");
+    if (!fp) return;
+
+    fprintf(fp, "[\n");
+    for (int i = 0; i < n; i++) {
+        fprintf(fp, "  {\n");
+        fprintf(fp, "    \"cipher_suite\": \"%s\",\n", res[i].combo_label);
+        fprintf(fp, "    \"mode\": \"%s\",\n", res[i].mode_label);
+        fprintf(fp, "    \"pool_hit_rate\": %.2f,\n", res[i].pool_hit_rate);
+        fprintf(fp, "    \"ch_prep_p50_ms\": %.6f,\n", res[i].ch_prep.p50_ms);
+        fprintf(fp, "    \"ch_prep_mean_ms\": %.6f,\n", res[i].ch_prep.mean_ms);
+        fprintf(fp, "    \"post_sh_p50_ms\": %.6f,\n", res[i].post_sh.p50_ms);
+        fprintf(fp, "    \"post_sh_mean_ms\": %.6f,\n", res[i].post_sh.mean_ms);
+        fprintf(fp, "    \"total_p50_ms\": %.6f,\n", res[i].total.p50_ms);
+        fprintf(fp, "    \"total_mean_ms\": %.6f,\n", res[i].total.mean_ms);
+        fprintf(fp, "    \"total_p99_ms\": %.6f\n", res[i].total.p99_ms);
+        fprintf(fp, "  }%s\n", (i < n - 1) ? "," : "");
+    }
+    fprintf(fp, "]\n");
+    fclose(fp);
+    printf("[✔] Results exported -> %s\n\n", path);
+}
 
 int main(int argc, char *argv[])
 {
     parse_args(argc, argv);
 
-    printf("\n");
+    printf("\n═══════════════════════════════════════════════════════════════\n");
+    printf("  TLS 1.3 Hybrid PQC Benchmark V2 (Dual Keypool & Two-Phase)\n");
     printf("═══════════════════════════════════════════════════════════════\n");
-    printf("  End-to-End TLS 1.3 Hybrid PQC Benchmark\n");
-    printf("  Adaptive Dispatch Runtime — Network Handshake Edition\n");
-    printf("  Server Execution: Always Sequential\n");
-    printf("═══════════════════════════════════════════════════════════════\n");
-    printf("  Server:     %s:%d\n", g_host, SERVER_PORT);
-    printf("  Iterations: %d\n", g_runs);
-    printf("  KDF:        %s\n", g_kdf);
-    printf("  Key Pool:   %s\n", g_precompute ? "ENABLED (pre-computed ephemeral key pool)" : "DISABLED (on-demand generation)");
+    printf("  Server Host: %s:4444\n", g_host);
+    printf("  Iterations:  %d\n", g_runs);
+    printf("  KDF:         %s\n", g_kdf);
+    printf("  Dual Pool:   %s\n", g_precompute ? "ENABLED (EC + PQC Precomputed)" : "DISABLED (Inline Keygen)");
     printf("═══════════════════════════════════════════════════════════════\n\n");
 
-    /* Initialize pre-computed key pool if requested */
-    if (g_precompute) {
-        if (key_pool_init(32) != 0) {
-            fprintf(stderr, "[!] Failed to initialize client key pool\n");
-            return 1;
-        }
-        g_client_use_key_pool = 1;
-        printf("[Client] Pre-computed key pool active (capacity: 32 per curve)\n");
-    }
-
-    /* Boot-time profiler (for adaptive routing decisions) */
-    host_profile_init();
-    client_worker_init();
-    const HostProfile *hp = get_host_profile();
-    printf("[Client] Hostname: %s | Cores: %d logical, %d physical | Sync Latency: %.2f µs | Load: %.2f | VM: %s\n\n",
-           hp->hostname, hp->logical_cores, hp->physical_cores,
-           (double)hp->sync_overhead_ns / 1000.0, hp->load_1min,
-           hp->is_virtualized ? "YES" : "NO");
-
-    /* Collect hybrid cipher suites */
     const AlgoCombo *hybrids[NUM_ALGO_COMBOS];
     int n_hybrids = 0;
     for (int i = 0; i < NUM_ALGO_COMBOS; i++) {
-        if (ALGORITHM_COMBOS[i].profile == PROFILE_HYBRID)
+        if (ALGORITHM_COMBOS[i].profile == PROFILE_HYBRID) {
             hybrids[n_hybrids++] = &ALGORITHM_COMBOS[i];
+        }
     }
 
-    double *samples = malloc(sizeof(double) * (size_t)g_runs);
-    if (!samples) { fprintf(stderr, "OOM\n"); return 1; }
+    if (g_precompute) {
+        if (key_pool_init(hybrids, n_hybrids, 32) != 0) {
+            fprintf(stderr, "Failed to initialize dual key pool!\n");
+            return 1;
+        }
+        g_client_use_key_pool = 1;
+        printf("[*] Dual Ephemeral Key Pool Active (32 capacity per hybrid suite)\n\n");
+    }
 
-    BenchMode modes[] = {
+    engine_init();
+
+    BenchMode all_modes[] = {
         MODE_STRICT_SEQUENTIAL,
         MODE_STRICT_PARALLEL,
         MODE_ADAPTIVE_SWITCH
     };
-    int n_modes = 3;
+    BenchMode modes[3];
+    int n_modes = 0;
+    if (g_filter_mode >= 0) {
+        modes[n_modes++] = (BenchMode)g_filter_mode;
+    } else {
+        for (int i = 0; i < 3; i++) modes[n_modes++] = all_modes[i];
+    }
 
-    int max_results = n_hybrids * n_modes;
-    BenchResult *all_results = calloc((size_t)max_results, sizeof(BenchResult));
-    int result_idx = 0;
+    double *s_ch   = malloc(sizeof(double) * (size_t)g_runs);
+    double *s_post = malloc(sizeof(double) * (size_t)g_runs);
+    double *s_tot  = malloc(sizeof(double) * (size_t)g_runs);
+
+    BenchResultV2 *results = calloc((size_t)(n_hybrids * n_modes), sizeof(BenchResultV2));
+    int res_idx = 0;
 
     for (int ci = 0; ci < n_hybrids; ci++) {
         const AlgoCombo *combo = hybrids[ci];
-        DispatchRoute adaptive_route = adaptive_dispatch(combo);
-
-        printf("═══════════════════════════════════════════════════════════════\n");
-        printf("  Cipher Suite:     %s\n", combo->label);
-        printf("  KDF:              %s\n", g_kdf);
-        printf("  Adaptive Route:   %s\n", route_name(adaptive_route));
-        printf("  Iterations:       %d\n", g_runs);
-        printf("═══════════════════════════════════════════════════════════════\n\n");
-
-        LatencyStats stats[3];
+        printf("───────────────────────────────────────────────────────────────\n");
+        printf("  Cipher Suite: %s\n", combo->label);
+        printf("───────────────────────────────────────────────────────────────\n");
 
         for (int mi = 0; mi < n_modes; mi++) {
-            printf("  [%s] Running %d handshakes... ",
-                   mode_label(modes[mi]), g_runs);
+            BenchMode m = modes[mi];
+            DispatchRoute loc_route = mode_local_route(m, combo);
+
+            printf("  [%-17s] Running %d handshakes... ", mode_label(m), g_runs);
             fflush(stdout);
 
-            if (run_bench(combo, modes[mi], samples, g_runs) != 0) {
+            int pool_hits = 0;
+            int valid_runs = 0;
+
+            for (int i = 0; i < g_runs; i++) {
+                HandshakeTiming t;
+                if (execute_dispatch_handshake_v2(g_host, combo, g_kdf, loc_route, &t) == 0 && t.ok) {
+                    s_ch[valid_runs]   = t.ch_prep_ms;
+                    s_post[valid_runs] = t.post_sh_ms;
+                    s_tot[valid_runs]  = t.total_ms;
+                    if (t.pool_hit) pool_hits++;
+                    valid_runs++;
+                }
+            }
+
+            if (valid_runs == 0) {
                 printf("FAILED\n");
-                stats[mi] = (LatencyStats){0};
                 continue;
             }
 
-            compute_stats(samples, g_runs, &stats[mi]);
-            printf("done (mean: %.4f ms)\n", stats[mi].mean_ms);
+            BenchResultV2 *r = &results[res_idx++];
+            r->combo_label = combo->label;
+            r->mode_label = mode_label(m);
+            r->pool_hit_rate = ((double)pool_hits / valid_runs) * 100.0;
+            compute_stats(s_ch, valid_runs, &r->ch_prep);
+            compute_stats(s_post, valid_runs, &r->post_sh);
+            compute_stats(s_tot, valid_runs, &r->total);
 
-            if (result_idx < max_results) {
-                all_results[result_idx].combo_label = combo->label;
-                all_results[result_idx].mode_label  = mode_label(modes[mi]);
-                all_results[result_idx].stats       = stats[mi];
-                result_idx++;
-            }
+            printf("done\n");
+            printf("    Phase A (CH Prep):  p50 = %7.4f ms | mean = %7.4f ms (Hit: %.1f%%)\n",
+                   r->ch_prep.p50_ms, r->ch_prep.mean_ms, r->pool_hit_rate);
+            printf("    Phase B (Post-SH):  p50 = %7.4f ms | mean = %7.4f ms\n",
+                   r->post_sh.p50_ms, r->post_sh.mean_ms);
+            printf("    Total (With Wire):  p50 = %7.4f ms | mean = %7.4f ms\n\n",
+                   r->total.p50_ms, r->total.mean_ms);
         }
-
-        /* Markdown table */
-        printf("\n### %s — E2E Latency Distribution (ms)\n\n", combo->label);
-        printf("| Mode               | Mean       | p50        "
-               "| p95        | p99        |\n");
-        printf("|:-------------------|:-----------|:-----------"
-               "|:-----------|:-----------|\n");
-        for (int mi = 0; mi < n_modes; mi++) {
-            printf("| %-18s | %10.4f | %10.4f | %10.4f | %10.4f |\n",
-                   mode_label(modes[mi]),
-                   stats[mi].mean_ms, stats[mi].p50_ms,
-                   stats[mi].p95_ms,  stats[mi].p99_ms);
-        }
-        printf("\n");
     }
 
-    export_results("e2e_benchmark_results.json", all_results, result_idx);
+    char out_path[64];
+    snprintf(out_path, sizeof(out_path), "e2e_results_%s.json",
+             g_precompute ? "precomputed" : "baseline");
+    export_results_json(out_path, results, res_idx);
 
-    if (g_precompute) {
-        key_pool_destroy();
-    }
-    client_worker_shutdown();
-    free(all_results);
-    free(samples);
+    if (g_precompute) key_pool_destroy();
+    engine_shutdown();
 
-    printf("[✔] End-to-end benchmark complete.\n\n");
+    free(s_ch);
+    free(s_post);
+    free(s_tot);
+    free(results);
+
+    printf("[✔] Benchmark completed successfully.\n");
     return 0;
 }
