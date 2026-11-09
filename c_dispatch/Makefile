@@ -5,12 +5,18 @@
 # ═══════════════════════════════════════════════════════════════════
 
 # ─── liboqs detection (Standard Linux /usr, /usr/local, or user dirs) ───
-LIBOQS_DIR ?= $(firstword $(wildcard /home/pharsyde0/oqs /home/sudoroot/_oqs /home/pharsyde0/_oqs /usr/local /usr))
-ifeq ($(LIBOQS_DIR),)
-  LIBOQS_DIR := /usr
+CANDIDATE_OQS_DIRS := /home/ec2-user/_oqs /home/ec2-user/oqs \
+                      /home/sudoroot/_oqs /home/pharsyde0/_oqs /home/pharsyde0/oqs \
+                      /usr/local /usr
+
+FOUND_OQS_H := $(firstword $(wildcard $(addsuffix /include/oqs/oqs.h,$(CANDIDATE_OQS_DIRS))))
+ifneq ($(FOUND_OQS_H),)
+  LIBOQS_DIR ?= $(patsubst %/include/oqs/oqs.h,%,$(FOUND_OQS_H))
+else
+  LIBOQS_DIR ?= /usr/local
 endif
 
-LIBOQS_LIB_DIR := $(wildcard $(LIBOQS_DIR)/lib64)
+LIBOQS_LIB_DIR := $(firstword $(wildcard $(LIBOQS_DIR)/lib64 $(LIBOQS_DIR)/lib))
 ifeq ($(LIBOQS_LIB_DIR),)
   LIBOQS_LIB_DIR := $(LIBOQS_DIR)/lib
 endif
