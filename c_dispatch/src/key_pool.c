@@ -15,6 +15,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 #include <openssl/crypto.h>
 #include <oqs/oqs.h>
@@ -183,6 +184,11 @@ int key_pool_init(const AlgoCombo *const *combos, int n_combos, size_t capacity)
     pthread_mutex_init(&g_pool.worker_mutex, NULL);
     pthread_cond_init(&g_pool.refill_cond, NULL);
 
+    if (capacity >= 32) {
+        printf("[*] Pre-warming client dual key pool (%zu shares/suite)...\n", capacity);
+        fflush(stdout);
+    }
+
     for (int i = 0; i < n_combos; i++) {
         ComboKeyRing *ring = &g_pool.rings[i];
         ring->combo = combos[i];
@@ -198,9 +204,11 @@ int key_pool_init(const AlgoCombo *const *combos, int n_combos, size_t capacity)
             return -1;
         }
 
-        /* Synchronously pre-fill 4 slots per combo to ensure instant readiness */
-        size_t warm = (capacity >= 4) ? 4 : capacity;
-        for (size_t s = 0; s < warm; s++) {
+        struct timespec t0, t1;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+
+        /* Synchronously pre-fill full capacity before timing starts */
+        for (size_t s = 0; s < capacity; s++) {
             ClientKeyShare share;
             if (generate_single_share(ring->combo, &share) == 0) {
                 ring->slots[ring->tail] = share;
@@ -208,6 +216,14 @@ int key_pool_init(const AlgoCombo *const *combos, int n_combos, size_t capacity)
                 ring->count++;
                 g_pool.total_replenished++;
             }
+        }
+
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        if (capacity >= 32) {
+            double ms = (t1.tv_sec - t0.tv_sec) * 1000.0 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
+            printf("  [+] Suite %-2d (%-33s): %zu/%zu dual shares ready (%.1f ms)\n",
+                   combos[i]->id, combos[i]->label, ring->count, capacity, ms);
+            fflush(stdout);
         }
     }
 
@@ -252,13 +268,16 @@ int key_pool_pop(const AlgoCombo *combo, ClientKeyShare *out_share, int *out_hit
         target_ring->count--;
         g_pool.total_popped++;
 
-        if (target_ring->count < (target_ring->capacity / 2)) {
+        size_t low_wm = (target_ring->capacity < 32) ? (target_ring->capacity / 2) : 16;
+        int need_signal = (target_ring->count < low_wm);
+        pthread_mutex_unlock(&target_ring->lock);
+
+        if (need_signal) {
             pthread_mutex_lock(&g_pool.worker_mutex);
             pthread_cond_signal(&g_pool.refill_cond);
             pthread_mutex_unlock(&g_pool.worker_mutex);
         }
 
-        pthread_mutex_unlock(&target_ring->lock);
         if (out_hit) *out_hit = 1;
         return 0;
     }

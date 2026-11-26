@@ -38,6 +38,7 @@
 #define SERVER_PORT 4444
 
 int g_client_use_key_pool = 0;
+int g_server_port         = SERVER_PORT;
 
 typedef struct {
     double ch_prep_ms;
@@ -67,7 +68,7 @@ int execute_dispatch_handshake_v2(const char *host,
 
     struct sockaddr_in srv = {
         .sin_family = AF_INET,
-        .sin_port   = htons(SERVER_PORT),
+        .sin_port   = htons((uint16_t)g_server_port),
     };
     inet_pton(AF_INET, host, &srv.sin_addr);
 

@@ -40,9 +40,19 @@
 
 #define SERVER_HOST "0.0.0.0"
 #define SERVER_PORT 4444
-#define DEFAULT_POOL_CAPACITY 64
+#define DEFAULT_POOL_CAPACITY 1024
+#define IDLE_REFILL_DELAY_MS  500ULL
 
 /* ─── Server Precomputed Key Share Pool ────────────────────────────── */
+
+static inline uint64_t now_monotonic_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)(ts.tv_nsec / 1000000L);
+}
+
+static atomic_uint_fast64_t g_last_activity_ms = 0;
 
 typedef struct {
     EVP_PKEY *srv_priv;
@@ -106,21 +116,40 @@ static void *server_key_pool_worker_loop(void *arg)
     ServerKeyPool *p = (ServerKeyPool *)arg;
 
     while (1) {
+        int urgent = 0;
         pthread_mutex_lock(&p->worker_mutex);
         while (p->running) {
-            int need_refill = 0;
+            urgent = 0;
+            int any_deficit = 0;
             for (int r = 0; r < p->num_rings; r++) {
                 ServerKeyRing *ring = &p->rings[r];
                 pthread_mutex_lock(&ring->lock);
+                size_t low_wm = (ring->capacity < 64) ? (ring->capacity / 2) : 32;
+                if (ring->count < low_wm) {
+                    urgent = 1;
+                }
                 if (ring->count < ring->capacity) {
-                    need_refill = 1;
-                    pthread_mutex_unlock(&ring->lock);
-                    break;
+                    any_deficit = 1;
                 }
                 pthread_mutex_unlock(&ring->lock);
             }
-            if (need_refill) break;
-            pthread_cond_wait(&p->refill_cond, &p->worker_mutex);
+
+            uint64_t last_ms = atomic_load(&g_last_activity_ms);
+            uint64_t now_ms  = now_monotonic_ms();
+            int is_idle = (last_ms == 0) || ((now_ms - last_ms) >= IDLE_REFILL_DELAY_MS);
+
+            if (urgent || (any_deficit && is_idle)) {
+                break;
+            }
+
+            struct timespec wake_ts;
+            clock_gettime(CLOCK_REALTIME, &wake_ts);
+            wake_ts.tv_nsec += 500000000L; /* 500 ms check interval */
+            if (wake_ts.tv_nsec >= 1000000000L) {
+                wake_ts.tv_sec += 1;
+                wake_ts.tv_nsec -= 1000000000L;
+            }
+            pthread_cond_timedwait(&p->refill_cond, &p->worker_mutex, &wake_ts);
         }
 
         if (!p->running) {
@@ -129,15 +158,24 @@ static void *server_key_pool_worker_loop(void *arg)
         }
         pthread_mutex_unlock(&p->worker_mutex);
 
+        unsigned long cycle_replenished = 0;
         for (int r = 0; r < p->num_rings && p->running; r++) {
             ServerKeyRing *ring = &p->rings[r];
+            size_t low_wm = (ring->capacity < 64) ? (ring->capacity / 2) : 32;
+
             while (p->running) {
                 pthread_mutex_lock(&ring->lock);
-                if (ring->count >= ring->capacity) {
-                    pthread_mutex_unlock(&ring->lock);
+                size_t cur_count = ring->count;
+                pthread_mutex_unlock(&ring->lock);
+
+                if (cur_count >= ring->capacity) break;
+
+                /* Yield CPU immediately if active client traffic resumed and pool is safe */
+                uint64_t last_ms = atomic_load(&g_last_activity_ms);
+                if (cur_count >= low_wm && last_ms != 0 &&
+                    (now_monotonic_ms() - last_ms) < IDLE_REFILL_DELAY_MS) {
                     break;
                 }
-                pthread_mutex_unlock(&ring->lock);
 
                 ServerKeyShare share;
                 if (generate_server_share(ring->combo, &share) != 0) {
@@ -151,6 +189,7 @@ static void *server_key_pool_worker_loop(void *arg)
                     ring->tail = (ring->tail + 1) % ring->capacity;
                     ring->count++;
                     atomic_fetch_add(&p->total_replenished, 1);
+                    cycle_replenished++;
                     pthread_mutex_unlock(&ring->lock);
                 } else {
                     pthread_mutex_unlock(&ring->lock);
@@ -158,6 +197,12 @@ static void *server_key_pool_worker_loop(void *arg)
                     break;
                 }
             }
+        }
+
+        if (cycle_replenished > 0 && !urgent) {
+            printf("[Server Pool] Idle window: replenished %lu shares back to capacity (%zu/suite)\n",
+                   cycle_replenished, p->capacity);
+            fflush(stdout);
         }
     }
     return NULL;
@@ -179,6 +224,7 @@ static int server_key_pool_init(size_t capacity)
     memset(&g_server_pool, 0, sizeof(g_server_pool));
     g_server_pool.capacity = capacity;
     g_server_pool.num_rings = n_combos;
+    atomic_store(&g_last_activity_ms, now_monotonic_ms());
 
     pthread_mutex_init(&g_server_pool.worker_mutex, NULL);
     pthread_cond_init(&g_server_pool.refill_cond, NULL);
@@ -222,7 +268,7 @@ static int server_key_pool_init(size_t capacity)
     }
 
     g_server_pool.initialized = 1;
-    printf("[✔] Server Precomputation Complete: %lu shares ready in RAM (< 1 µs pop)\n\n",
+    printf("[✔] Server Precomputation Complete: %lu shares ready in RAM (< 1 µs pop, idle-window refill)\n\n",
            (unsigned long)(g_server_pool.num_rings * capacity));
     return 0;
 }
@@ -253,15 +299,22 @@ static int server_key_pool_pop(int combo_id, EVP_PKEY **out_priv, uint8_t *out_p
 
         atomic_fetch_add(&g_server_pool.total_popped, 1);
 
-        if (target_ring->count < target_ring->capacity / 2) {
-            pthread_cond_signal(&g_server_pool.refill_cond);
-        }
+        size_t low_wm = (target_ring->capacity < 64) ? (target_ring->capacity / 2) : 32;
+        int need_urgent = (target_ring->count < low_wm);
         pthread_mutex_unlock(&target_ring->lock);
+
+        if (need_urgent) {
+            pthread_mutex_lock(&g_server_pool.worker_mutex);
+            pthread_cond_signal(&g_server_pool.refill_cond);
+            pthread_mutex_unlock(&g_server_pool.worker_mutex);
+        }
         return 0;
     }
     pthread_mutex_unlock(&target_ring->lock);
 
+    pthread_mutex_lock(&g_server_pool.worker_mutex);
     pthread_cond_signal(&g_server_pool.refill_cond);
+    pthread_mutex_unlock(&g_server_pool.worker_mutex);
     return -1;
 }
 
@@ -269,8 +322,10 @@ static void server_key_pool_destroy(void)
 {
     if (!g_server_pool.initialized) return;
 
+    pthread_mutex_lock(&g_server_pool.worker_mutex);
     g_server_pool.running = 0;
     pthread_cond_signal(&g_server_pool.refill_cond);
+    pthread_mutex_unlock(&g_server_pool.worker_mutex);
     pthread_join(g_server_pool.worker_thread, NULL);
 
     for (int r = 0; r < g_server_pool.num_rings; r++) {
@@ -304,6 +359,8 @@ static void *handle_client(void *arg)
 {
     int fd = *(int *)arg;
     free(arg);
+
+    atomic_store(&g_last_activity_ms, now_monotonic_ms());
 
     WireHeaderV2 hdr;
     if (recv_all(fd, &hdr, sizeof(hdr)) != 0 ||
@@ -343,16 +400,16 @@ static void *handle_client(void *arg)
     uint8_t ecdh_ss[48];
     size_t ecdh_ss_len = sizeof(ecdh_ss);
     EVP_PKEY *srv_priv = NULL;
+    int srv_pool_hit = 0;
 
     if (combo->classical_curve != CURVE_NONE) {
-        int popped = 0;
         if (g_server_precompute) {
             if (server_key_pool_pop(combo->id, &srv_priv, srv_pub, &srv_pub_len) == 0) {
-                popped = 1;
+                srv_pool_hit = 1;
             }
         }
 
-        if (!popped) {
+        if (!srv_pool_hit) {
             srv_priv = crypto_generate_keypair(combo->classical_curve);
             if (!srv_priv) { free(cli_pqc_pk); close(fd); return NULL; }
 
@@ -459,12 +516,14 @@ static void *handle_client(void *arg)
 
     send_all(fd, fin_pkt, sizeof(fin_pkt));
 
+    atomic_store(&g_last_activity_ms, now_monotonic_ms());
+
     static atomic_ulong s_handshake_cnt = 0;
     unsigned long n = atomic_fetch_add(&s_handshake_cnt, 1) + 1;
-    if (n % 25 == 0 || n <= 3) {
+    if (n % 100 == 0 || n <= 3) {
         printf("[Server] Handshake #%lu completed: %s (id=%d)%s\n",
                n, combo->label, combo->id,
-               g_server_precompute ? " [Pool Hit]" : "");
+               g_server_precompute ? (srv_pool_hit ? " [Pool Hit]" : " [Pool Miss]") : "");
         fflush(stdout);
     }
 
